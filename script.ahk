@@ -3,7 +3,9 @@
 
 ; ===== CONFIGURACIÓN =====
 global libreriaDefecto := "LIBRERIA"
-global destinoBase := ".\dos\NATAPPS\FUSER\" . libreriaDefecto . "\SRC"
+global versionNatural := "213"  ; Valor por defecto
+global offsetLibreriaEncontrado := 0
+global destinoBase := ObtenerRutaDestino()  ; ← Se calcula dinámicamente
 global extensionesNatural := [".NSN", ".NSP", ".NSM", ".NSL", ".NSG", ".NSD", ".NSC", ".NSA", ".NSH"]
 global rutasDefecto := ["C:\Users\" . A_UserName . "\workspace110", "C:\Users\" . A_UserName . "\git"]
 
@@ -15,51 +17,201 @@ global nombreCarpetaSeleccionada := ""
 global mainGui := ""
 global listView := ""
 global esCarpetaPersonalizada := false  ; Flag para saber si es carpeta personalizada
+global WORK_SLOT_SIZE := 68
 
 ; ===== INICIO DEL SCRIPT =====
+; Detectar versión de Natural primero
+DetectarVersionNatural()
+
 ; Leer librería actual desde NATPARM.SAG al inicio
 libreriaActual := LeerLibreriaDeNATPARM()
+
 if libreriaActual != ""
     libreriaDefecto := libreriaActual
+else
+    libreriaDefecto := ""   ; ← Campo queda vacío si no hay librería asignada
+
+; Leer máximo de workfiles desde NATPARM.SAG al inicio (evita que quede en el default hardcodeado)
+workMaxEntries := LeerMaxWorkfilesDeNATPARM()
 
 MostrarMenuPrincipal()
 
-; ===== FUNCIÓN: LEER LIBRERÍA DE NATPARM.SAG (CORREGIDA PARA AHK v2) =====
-LeerLibreriaDeNATPARM() {
-    rutaNATPARM := A_ScriptDir . "\dos\NATURAL\213\PROF\NATPARM.SAG"
+; ===== FUNCIÓN: DETECTAR VERSIÓN DE NATURAL =====
+; Si soloVerificar=true, devuelve el bool sin modificar versionNatural (para el indicador visual)
+DetectarVersionNatural(soloVerificar := false) {
+    global versionNatural
+    
+    rutaBase := A_ScriptDir . "\dos\NATURAL"
+    
+    if DirExist(rutaBase) {
+        Loop Files, rutaBase . "\*", "D"
+        {
+            if RegExMatch(A_LoopFileName, "^\d+$") {
+                if !soloVerificar
+                    versionNatural := A_LoopFileName
+                return true
+            }
+        }
+    }
+    
+    ; Si no encuentra, mantener el valor por defecto (213)
+    return false
+}
+
+; ===== FUNCIÓN: FORMATEAR VERSIÓN PARA MOSTRAR =====
+FormatearVersion(version) {
+    ; Convertir "213" a "2.1.3"
+    if StrLen(version) = 3 {
+        return SubStr(version, 1, 1) . "." . SubStr(version, 2, 1) . "." . SubStr(version, 3, 1)
+    }
+    ; Si tiene otro formato, devolverlo tal cual
+    return version
+}
+
+; ===== FUNCIÓN: OBTENER OFFSET POR VERSIÓN (FALLBACK) =====
+ObtenerOffsetLibreriaPorVersion() {
+    global versionNatural
+    
+    offsets := Map(
+        "213", 0x205A,
+        "210", 0x2031,
+        "211", 0x2031,
+        "212", 0x2031,
+        "214", 0x205A
+    )
+    
+    if offsets.Has(versionNatural)
+        return offsets[versionNatural]
+    
+    versionBase := SubStr(versionNatural, 1, 3)
+    if offsets.Has(versionBase)
+        return offsets[versionBase]
+    
+    return 0x205A  ; Default
+}
+
+; ===== FUNCIÓN: BUSCAR OFFSET DE LIBRERÍA POR PATRÓN =====
+BuscarOffsetLibreriaPorPatron() {
+    global versionNatural
+    
+    rutaNATPARM := A_ScriptDir . "\dos\NATURAL\" . versionNatural . "\PROF\NATPARM.SAG"
     
     if !FileExist(rutaNATPARM) {
-        return ""
+        return 0
     }
     
     try {
-        ; Usar FileRead para leer bytes específicos
+        ; Leer el archivo completo como bytes
+        archivo := FileOpen(rutaNATPARM, "r")
+        tamaño := archivo.Length
+        contenido := Buffer(tamaño)
+        archivo.RawRead(contenido, tamaño)
+        archivo.Close()
+        
+        ; Patrón a buscar: 69 00 09 00 (en hexadecimal)
+        ; En bytes: [0x69, 0x00, 0x09, 0x00]
+        
+        ; Buscar el patrón en el archivo
+        offsetEncontrado := 0
+        
+        ; Recorrer el buffer buscando el patrón
+        ; Dejamos espacio para los 4 bytes del patrón + 8 bytes de nombre
+        Loop tamaño - 12 {
+            i := A_Index - 1  ; Índice base 0 para el buffer
+            
+            ; Verificar si encontramos el patrón
+            if (NumGet(contenido, i, "UChar") = 0x69 &&
+                NumGet(contenido, i + 1, "UChar") = 0x00 &&
+                NumGet(contenido, i + 2, "UChar") = 0x09 &&
+                NumGet(contenido, i + 3, "UChar") = 0x00) {
+                
+                ; El nombre de la librería está inmediatamente después del patrón
+                offsetEncontrado := i + 4
+                break
+            }
+        }
+        
+        if offsetEncontrado > 0 {
+            ; Leer el nombre en ese offset para verificar
+            nombreBytes := ""
+            Loop 8 {
+                byte := NumGet(contenido, offsetEncontrado + A_Index - 1, "UChar")
+                if byte = 0
+                    break
+                nombreBytes .= Chr(byte)
+            }
+            
+            nombreLimpio := Trim(nombreBytes)
+            
+            ; Verificar que el nombre parezca válido (letras mayúsculas, números, #, -)
+            if RegExMatch(nombreLimpio, "^[A-Z0-9# -]+$") {
+                return offsetEncontrado
+            }
+        }
+        
+        return 0  ; No encontrado
+        
+    } catch as err {
+        ; Error interno silencioso (no afecta al usuario)
+        return 0
+    }
+}
+
+; ===== FUNCIÓN: LEER LIBRERÍA DE NATPARM.SAG (CORREGIDA PARA AHK v2) =====
+LeerLibreriaDeNATPARM() {
+    global versionNatural, offsetLibreriaEncontrado
+    
+    rutaNATPARM := A_ScriptDir . "\dos\NATURAL\" . versionNatural . "\PROF\NATPARM.SAG"
+    
+    if !FileExist(rutaNATPARM)
+        return ""
+    
+    try {
+        ; Buscar el offset por patrón
+        offsetLibreria := BuscarOffsetLibreriaPorPatron()
+        
+        if offsetLibreria = 0 {
+            ; Silencioso: usamos el offset por versión pero NO mostramos cartel
+            offsetLibreria := ObtenerOffsetLibreriaPorVersion()
+        } else {
+            offsetLibreriaEncontrado := offsetLibreria
+        }
+        
         archivo := FileOpen(rutaNATPARM, "r")
         if !archivo
             return ""
         
-        ; Mover al offset 0x205A
-        archivo.Seek(0x205A)
+        archivo.Seek(offsetLibreria)
         
-        ; Leer 8 bytes
-        bytesLeidos := archivo.Read(8)
+        nombreLimpio := ""
+        Loop 8 {
+            byte := archivo.ReadUChar()
+            if byte = 0
+                break
+            nombreLimpio .= Chr(byte)
+        }
         archivo.Close()
         
-        ; Limpiar y retornar
-        nombreLimpio := StrReplace(bytesLeidos, Chr(0), "")
         nombreLimpio := Trim(nombreLimpio)
+        
+        ; Si no hay nombre válido → devolvemos vacío (para que el campo quede en blanco)
+        if nombreLimpio = "" || !RegExMatch(nombreLimpio, "^[A-Z0-9# -]+$")
+            return ""
         
         return nombreLimpio
         
-    } catch {
+    } catch as err {
+        ; Solo error real (no el aviso normal)
+        ; MsgBox("Error al leer NATPARM.SAG:`n" . err.Message, "Error", "IconX")
         return ""
     }
 }
 
 ; ===== FUNCIÓN: ESCRIBIR LIBRERÍA EN NATPARM.SAG (CORREGIDA PARA AHK v2) =====
 EscribirLibreriaEnNATPARM(nombreLibreria) {
-    ; Usar ruta absoluta
-    rutaNATPARM := A_ScriptDir . "\dos\NATURAL\213\PROF\NATPARM.SAG"
+    global versionNatural, offsetLibreriaEncontrado
+    
+    rutaNATPARM := A_ScriptDir . "\dos\NATURAL\" . versionNatural . "\PROF\NATPARM.SAG"
     
     if !FileExist(rutaNATPARM) {
         MsgBox("No se encontró NATPARM.SAG en:`n" . rutaNATPARM, "Error", "Icon!")
@@ -67,7 +219,19 @@ EscribirLibreriaEnNATPARM(nombreLibreria) {
     }
     
     try {
-        ; Usar FileOpen con modo "rw" (lectura/escritura)
+        ; Determinar offset a usar
+        offsetLibreria := offsetLibreriaEncontrado
+        
+        if offsetLibreria = "" || offsetLibreria = 0 {
+            ; Si no tenemos offset guardado, buscar ahora
+            offsetLibreria := BuscarOffsetLibreriaPorPatron()
+            
+            if offsetLibreria = 0 {
+                ; Silencioso: usamos el offset por versión sin mostrar nada al usuario
+                offsetLibreria := ObtenerOffsetLibreriaPorVersion()
+            }
+        }
+        
         archivo := FileOpen(rutaNATPARM, "rw")
         if !archivo {
             throw Error("No se pudo abrir el archivo")
@@ -78,101 +242,45 @@ EscribirLibreriaEnNATPARM(nombreLibreria) {
         if StrLen(nombreLimpio) > 8
             nombreLimpio := SubStr(nombreLimpio, 1, 8)
         
-        ; Rellenar con espacios si es necesario (8 caracteres fijos)
-        while StrLen(nombreLimpio) < 8 {
-            nombreLimpio .= " "
+        ; Ir al offset encontrado
+        archivo.Seek(offsetLibreria)
+        
+        ; Escribir el nombre byte a byte
+        Loop StrLen(nombreLimpio) {
+            char := SubStr(nombreLimpio, A_Index, 1)
+            archivo.WriteUChar(Ord(char))
         }
         
-        ; Ir a la posición 0x205A
-        archivo.Seek(0x205A)
-        
-        ; Escribir los 8 caracteres
-        archivo.Write(nombreLimpio)
-        
-        ; Escribir byte 0x00 en posición 0x2062 (siguiente byte después del nombre de librería)
-        archivo.Seek(0x2062)
-        archivo.WriteUChar(0x00)
+        ; Rellenar con 0x00 hasta completar los 8 bytes del campo
+        ; Esto evita dejar basura de una librería anterior más larga
+        Loop (8 - StrLen(nombreLimpio)) {
+            archivo.WriteUChar(0x00)
+        }
         
         archivo.Close()
         
-        ; Verificar que se escribió correctamente
+        ; Verificar
         nombreVerificado := LeerLibreriaDeNATPARM()
-        if nombreVerificado != Trim(nombreLimpio) {
+        if nombreVerificado != nombreLimpio {
             throw Error("No se pudo verificar la escritura")
         }
+        
+        ; Guardar el offset para futuras operaciones
+        offsetLibreriaEncontrado := offsetLibreria
         
         return true
         
     } catch as err {
-        ; Método alternativo si el anterior falla
-        try {
-            MsgBox("Intentando método alternativo...", "Información", "Icon!")
-            
-            ; Leer todo el archivo, modificar y reescribir
-            contenido := FileRead(rutaNATPARM, "RAW")
-            if StrLen(contenido) < 0x205A + 8 {
-                ; Extender el archivo si es necesario
-                while StrLen(contenido) < 0x205A + 8 {
-                    contenido .= Chr(0)
-                }
-            }
-            
-            ; Preparar nombre (8 bytes fijos)
-            nombreLimpio := StrUpper(Trim(nombreLibreria))
-            if StrLen(nombreLimpio) > 8
-                nombreLimpio := SubStr(nombreLimpio, 1, 8)
-            
-            ; Rellenar con espacios
-            while StrLen(nombreLimpio) < 8 {
-                nombreLimpio .= " "
-            }
-            
-            ; Convertir string a bytes
-            nombreBytes := Buffer(8)
-            Loop Parse, nombreLimpio {
-                NumPut("UChar", Ord(A_LoopField), nombreBytes, A_Index - 1)
-            }
-            
-            ; Insertar en la posición correcta
-            contenidoBytes := Buffer(StrLen(contenido))
-            Loop StrLen(contenido) {
-                NumPut("UChar", Ord(SubStr(contenido, A_Index, 1)), contenidoBytes, A_Index - 1)
-            }
-            
-            ; Copiar los bytes del nombre
-            Loop 8 {
-                NumPut("UChar", NumGet(nombreBytes, A_Index - 1, "UChar"), 
-                      contenidoBytes, 0x205A + A_Index - 1)
-            }
-            
-            ; Escribir archivo completo
-            FileDelete(rutaNATPARM)
-            nuevoArchivo := FileOpen(rutaNATPARM, "w")
-            nuevoArchivo.RawWrite(contenidoBytes, contenidoBytes.Size)
-            nuevoArchivo.Close()
-            
-            return true
-            
-        } catch as err2 {
-            MsgBox("Error crítico al escribir NATPARM.SAG:`n`n" 
-                . "Método 1: " . err.Message . "`n"
-                . "Método 2: " . err2.Message . "`n`n"
-                . "Solución manual:`n"
-                . "1. Cierra Natural completamente`n"
-                . "2. Ve a: " . rutaNATPARM . "`n"
-                . "3. Abre NATPARM.SAG con editor hexadecimal`n"
-                . "4. Cambia los bytes en offset 205A a 2061`n"
-                . "5. Escribe: " . nombreLibreria, 
-                "Error Crítico", "IconX")
-            return false
-        }
+        MsgBox("Error al escribir NATPARM.SAG:`n" . err.Message, "Error", "IconX")
+        return false
     }
 }
 
 MostrarMenuPrincipal() {
     global mainGui, txtRutaActual, btnEscanear, txtLibreria
+	versionFormateada := FormatearVersion(versionNatural)
 
-    mainGui := Gui("+Resize +MinSize640x500 -MaximizeBox", "Migrador: NaturalONE → Natural 2.1.3")
+    mainGui := Gui("-MaximizeBox", "Migrador: NaturalONE → Natural " . versionFormateada)
     mainGui.BackColor := "F5F5F7"
     mainGui.SetFont("s12 c333333", "Segoe UI")
 
@@ -180,13 +288,13 @@ MostrarMenuPrincipal() {
     mainGui.SetFont("s14 bold c0D47A1", "Segoe UI")
     mainGui.Add("Text", "x40 y25 w560 Center", "MIGRACIÓN DE CÓDIGO NATURAL")
     mainGui.SetFont("s12 c555555", "Segoe UI")
-    mainGui.Add("Text", "x40 y60 w560 Center", "NaturalONE  →  Natural 2.1.3 (Windows 3.1)")
+    mainGui.Add("Text", "x40 y60 w560 Center", "NaturalONE  →  Natural " . versionFormateada . " (Windows 3.1)")
 
     mainGui.Add("Progress", "x60 y100 w520 h2 BackgroundE0E0E0 -Smooth Disabled")
 
     ; Sección origen
     mainGui.SetFont("s11 c444444", "Segoe UI")
-    mainGui.Add("Text", "x40 y125", "1. Seleccione la carpeta de origen:")
+    mainGui.Add("Text", "x60 y125", "Seleccione la carpeta de origen:")
 
     ; === Botones Workspace y Git uno al lado del otro ===
     margenIzq   := 60
@@ -230,9 +338,12 @@ MostrarMenuPrincipal() {
     txtLibreria := mainGui.Add("Edit", "x" margenIzq " y" (yLibreria+25) " w520 h32 BackgroundFFFFFF c333333 Uppercase", libreriaDefecto)
     txtLibreria.SetFont("s11", "Segoe UI")
     
+    ; Agregar evento Change para filtrar en tiempo real
+    txtLibreria.OnEvent("Change", FiltrarLibreria)
+    
     mainGui.Add("Progress", "x60 y" (yLibreria+70) " w520 h2 BackgroundE0E0E0 -Smooth Disabled")
 
-    ; Botón Escanear (principal)
+	; Botón ESCANEAR (ahora arriba)
     yEscanear := yLibreria + 90
     btnEscanear := mainGui.Add("Button", "x" margenIzq " y" yEscanear " w520 h60 Disabled", "🔍   ESCANEAR OBJETOS NATURAL")
     btnEscanear.Opt("+BackgroundFF5722")
@@ -240,8 +351,16 @@ MostrarMenuPrincipal() {
 
     mainGui.Add("Progress", "x60 y" (yEscanear+75) " w520 h2 BackgroundE0E0E0 -Smooth Disabled")
 
+    ; Botón Gestionar Workfiles (ahora abajo)
+    yWorkfiles := yEscanear + 90
+    btnWorkfiles := mainGui.Add("Button", "x" margenIzq " y" yWorkfiles " w520 h42", "🗂  Administrar Archivos de Trabajo (WORK)")
+    btnWorkfiles.Opt("+Background37474F")
+    btnWorkfiles.SetFont("s10 cFFFFFF", "Segoe UI")
+
+    mainGui.Add("Progress", "x60 y" (yWorkfiles+55) " w520 h2 BackgroundE0E0E0 -Smooth Disabled")
+
     ; Botón Salir
-    ySalir := yEscanear + 95
+    ySalir := yWorkfiles + 75
     btnSalir := mainGui.Add("Button", "x" margenIzq " y" ySalir " w520 h45", "❌  Salir")
     btnSalir.Opt("+Background757575")
     btnSalir.SetFont("s11 cFFFFFF", "Segoe UI")
@@ -251,22 +370,866 @@ MostrarMenuPrincipal() {
     btnGit.OnEvent("Click", (*) => SeleccionarRuta(rutasDefecto[2]))
     btnCustom.OnEvent("Click", (*) => SeleccionarRutaPersonalizada())
     btnEscanear.OnEvent("Click", (*) => EscanearArchivos())
+    btnWorkfiles.OnEvent("Click", (*) => MostrarGestionWorkfiles())
     btnSalir.OnEvent("Click", (*) => ExitApp())
     txtLibreria.OnEvent("LoseFocus", (*) => ActualizarDestino())
 
     mainGui.OnEvent("Close", (*) => ExitApp())
-    mainGui.Show("Center w640 h660")
+    mainGui.Show("Center w640 h740")
     
     ; Actualizar destinoBase con la librería actual
-    destinoBase := ".\dos\NATAPPS\FUSER\" . libreriaDefecto . "\SRC"
+    destinoBase := ObtenerRutaDestino()
+}
+
+; =============================================================================
+;   GESTIÓN DE WORKFILES (WORK) — NATPARM.SAG
+; =============================================================================
+
+; ===== CONSTANTES DE WORKFILES =====
+; Cada entrada de workfile en NATPARM.SAG ocupa 68 bytes:
+;   - 8 bytes de nombre (padded con 0x00)
+;   - 60 bytes restantes de la estructura interna del slot
+; El bloque de workfiles comienza en un offset que se busca por patrón.
+; Patrón de inicio del bloque WORK: 57 4F 52 4B (= "WORK" en ASCII)
+; seguido del byte de cantidad máxima (0x1E = 30 por defecto).
+
+global WORK_MAX_DEFAULT  := 30
+global WORK_SLOT_SIZE    := 68   ; bytes por entrada en NATPARM.SAG
+global WORK_NAME_SIZE    := 8    ; bytes de nombre por entrada
+global workfilesData     := []   ; Array global con los workfiles cargados
+global workfileOffsets   := []   ; Offset donde empieza el nombre de cada workfile
+global workfileLengths   := []   ; Longitud original (bytes) de cada nombre
+global workOffsetBase    := 0    ; (reservado, ya no se usa para leer)
+global workMaxOffset     := 0    ; Offset del byte de máximo workfiles en NATPARM.SAG
+global workMaxEntries    := 30   ; Máximo de workfiles leído de NATPARM.SAG
+
+; ===== FUNCIÓN AUXILIAR: leer bytes hasta 0x00 desde un offset en un buffer =====
+WF_LeerHasta00(buf, tamaño, offset) {
+    path := ""
+    pos  := offset
+    while pos < tamaño {
+        b := NumGet(buf, pos, "UChar")
+        if b = 0
+            break
+        path .= Chr(b)
+        pos++
+    }
+    return {path: path, len: pos - offset}
+}
+
+; ===== FUNCIÓN AUXILIAR: buscar rutas por patrón 3A 5C (:\) en el buffer =====
+; Reglas:
+;  - El byte en (pos-1) debe ser una letra A-Z/a-z (letra de unidad, sin Ñ)
+;  - Se lee desde (pos-1) hasta encontrar 0x00, máximo 51 caracteres
+;  - El nombre de archivo sigue las reglas 8.3 (SFN)
+WF_BuscarRutasPorPatron(buf, tamaño) {
+    rutas := []
+    offsets := []
+    lens := []
+
+    i := 1   ; empezar en 1 para poder leer buf[i-1]
+    while i < tamaño - 1 {
+        b0 := NumGet(buf, i,     "UChar")   ; posible 3A (:)
+        b1 := NumGet(buf, i + 1, "UChar")   ; posible 5C (\)
+        if (b0 = 0x3A && b1 = 0x5C) {
+            ; byte anterior debe ser letra A-Z o a-z (letra de unidad)
+            letraUnidad := NumGet(buf, i - 1, "UChar")
+            if ((letraUnidad >= 0x41 && letraUnidad <= 0x5A)   ; A-Z
+             || (letraUnidad >= 0x61 && letraUnidad <= 0x7A)) { ; a-z
+                ; La ruta comienza en (i-1): letra + :\ + resto
+                offsetInicio := i - 1
+                path := ""
+                pos  := offsetInicio
+                while (pos < tamaño && StrLen(path) < 51) {
+                    b := NumGet(buf, pos, "UChar")
+                    if b = 0
+                        break
+                    path .= Chr(b)
+                    pos++
+                }
+                ; Truncar a 51 si es necesario
+                if StrLen(path) > 51
+                    path := SubStr(path, 1, 51)
+                rutas.Push(path)
+                offsets.Push(offsetInicio)
+                lens.Push(pos - offsetInicio)
+                ; Saltar al final de esta ruta para no reutilizar bytes
+                i := pos + 1
+                continue
+            }
+        }
+        i++
+    }
+    return {rutas: rutas, offsets: offsets, lens: lens}
+}
+
+; ===== FUNCIÓN AUXILIAR: buscar rutas desde un offset inicial =====
+; Igual que WF_BuscarRutasPorPatron pero arranca desde offsetInicial.
+; lens[] almacena el ESPACIO REAL disponible en cada slot:
+;   = longitud del texto + bytes nulos de relleno que siguen (hasta 51 total)
+WF_BuscarRutasPorPatron_Desde(buf, tamaño, offsetInicial) {
+    rutas   := []
+    offsets := []
+    lens    := []
+
+    i := offsetInicial + 1   ; +1 para poder leer buf[i-1]
+    while i < tamaño - 1 {
+        b0 := NumGet(buf, i,     "UChar")   ; posible 3A (:)
+        b1 := NumGet(buf, i + 1, "UChar")   ; posible 5C (\)
+        if (b0 = 0x3A && b1 = 0x5C) {
+            letraUnidad := NumGet(buf, i - 1, "UChar")
+            if ((letraUnidad >= 0x41 && letraUnidad <= 0x5A)   ; A-Z mayúsculas
+             || (letraUnidad >= 0x61 && letraUnidad <= 0x7A)) { ; a-z minúsculas
+                offsetRuta := i - 1
+                path := ""
+                pos  := offsetRuta
+                ; Leer el texto hasta 0x00 (máx 51 chars)
+                while (pos < tamaño && StrLen(path) < 51) {
+                    b := NumGet(buf, pos, "UChar")
+                    if b = 0
+                        break
+                    path .= Chr(b)
+                    pos++
+                }
+                ; Truncar a 51 si es necesario
+                if StrLen(path) > 51
+                    path := SubStr(path, 1, 51)
+                    
+                textoLen := pos - offsetRuta   ; longitud del texto
+                
+                ; Contar bytes nulos de relleno que siguen al terminador
+                ; para conocer el espacio total disponible en el slot
+                posNull := pos   ; pos apunta al primer 0x00 terminador
+                espacioTotal := textoLen
+                while (posNull < tamaño && espacioTotal < 51) {
+                    if NumGet(buf, posNull, "UChar") != 0
+                        break
+                    espacioTotal++
+                    posNull++
+                }
+                
+                rutas.Push(path)
+                offsets.Push(offsetRuta)
+                lens.Push(espacioTotal)   ; espacio real = texto + relleno nulo
+                i := pos + 1
+                continue
+            }
+        }
+        i++
+    }
+    return {rutas: rutas, offsets: offsets, lens: lens}
+}
+
+; ===== FUNCIÓN: LEER WORKFILES DE NATPARM.SAG (por patrón 3A 5C = :\) =====
+; Algoritmo:
+;   1. Localizar el patrón 54 00 04 00 → byte siguiente = número máximo de WF
+;   2. Localizar el primer workfile con [maxByte] 00 35 00 desde ese offset
+;      → a partir de ahí buscar rutas por patrón 3A 5C (:\)
+;   3. Cada ruta comienza en la letra de unidad anterior a :\ y termina en 0x00
+;      (máximo 51 caracteres, nombres en formato 8.3)
+LeerWorkfilesDeNATPARM(maxEntries := 30) {
+    global versionNatural, workfileOffsets, workfileLengths, workMaxOffset
+
+    rutaNATPARM := A_ScriptDir . "\dos\NATURAL\" . versionNatural . "\PROF\NATPARM.SAG"
+    resultado        := []
+    workfileOffsets  := []
+    workfileLengths  := []
+
+    if !FileExist(rutaNATPARM)
+        return resultado
+
+    ; Leer todo el archivo en un buffer
+    archivo := FileOpen(rutaNATPARM, "r")
+    if !archivo
+        return resultado
+    tamaño := archivo.Length
+    buf    := Buffer(tamaño)
+    archivo.RawRead(buf, tamaño)
+    archivo.Close()
+
+    ; ── 1. Localizar el byte de máximo (patrón 00 54 00 04, valor en byte anterior) ──
+    if workMaxOffset = 0 {
+        Loop tamaño - 4 {
+            j := A_Index - 1
+            if (NumGet(buf, j,     "UChar") = 0x00
+             && NumGet(buf, j + 1, "UChar") = 0x54
+             && NumGet(buf, j + 2, "UChar") = 0x00
+             && NumGet(buf, j + 3, "UChar") = 0x04) {
+                workMaxOffset := j - 1   ; byte justo ANTES del patrón
+                break
+            }
+        }
+    }
+    if workMaxOffset = 0
+        return resultado
+
+    maxByte := NumGet(buf, workMaxOffset, "UChar")
+
+    ; ── 2. Localizar inicio del bloque: [maxByte] 00 35 00 ───────────────────
+    inicioBloque := 0
+    Loop tamaño - workMaxOffset - 4 {
+        i := workMaxOffset + A_Index - 1
+        if (NumGet(buf, i,     "UChar") = maxByte
+         && NumGet(buf, i + 1, "UChar") = 0x00
+         && NumGet(buf, i + 2, "UChar") = 0x35
+         && NumGet(buf, i + 3, "UChar") = 0x00) {
+            inicioBloque := i + 4   ; primer byte de la primera entrada
+            break
+        }
+    }
+    if inicioBloque = 0
+        return resultado
+
+    ; ── 3. Tamaño fijo de cada slot (según observaciones) ───────────────────
+    global WORK_SLOT_SIZE := 68   ; Definir esta constante si no existe
+
+    ; ── 4. Recorrer todos los slots secuencialmente ─────────────────────────
+    offsetActual := inicioBloque
+    Loop maxEntries {
+        offsetPath := offsetActual
+
+        ; Leer la cadena hasta 51 caracteres o hasta encontrar 0x00
+        ruta := ""
+        pos := offsetActual
+        while pos < offsetActual + 51 && pos < tamaño {
+            byte := NumGet(buf, pos, "UChar")
+            if byte = 0
+                break
+            ruta .= Chr(byte)
+            pos++
+        }
+
+        resultado.Push(ruta)
+        workfileOffsets.Push(offsetPath)
+        workfileLengths.Push(WORK_SLOT_SIZE)   ; Espacio total del slot
+
+        offsetActual += WORK_SLOT_SIZE
+        if offsetActual >= tamaño
+            break
+    }
+
+    ; Rellenar con vacíos si no se llegó al máximo
+    while resultado.Length < maxEntries {
+        resultado.Push("")
+        workfileOffsets.Push(0)
+        workfileLengths.Push(WORK_SLOT_SIZE)
+    }
+
+    return resultado
+}
+
+; ===== FUNCIÓN: ESCRIBIR UN WORKFILE EN NATPARM.SAG =====
+; Escribe el nuevo path en el offset previamente localizado por LeerWorkfilesDeNATPARM.
+; Regla: solo sobreescribe hasta la longitud original (rellena con 0x00 si es más corto,
+; trunca silenciosamente si es más largo).
+EscribirWorkfileEnNATPARM(numero, rutaCompleta) {
+    global versionNatural, workfileOffsets, workfileLengths
+
+    rutaNATPARM := A_ScriptDir . "\dos\NATURAL\" . versionNatural . "\PROF\NATPARM.SAG"
+
+    if !FileExist(rutaNATPARM) {
+        MsgBox("No se encontró NATPARM.SAG en:`n" . rutaNATPARM, "Error", "IconX")
+        return false
+    }
+
+    if numero < 1 || numero > workfileOffsets.Length {
+        MsgBox("Número de workfile inválido: " . numero, "Error", "IconX")
+        return false
+    }
+    
+    if workfileOffsets[numero] = 0 {
+        MsgBox("No se conoce el offset del Workfile #" . numero . ".`n"
+             . "Abra la ventana de Workfiles para que se relean los offsets.", "Error", "IconX")
+        return false
+    }
+
+    offsetPath  := workfileOffsets[numero]
+    longitudSlot := workfileLengths[numero]   ; Debe ser WORK_SLOT_SIZE (68)
+
+    rutaLimpia := Trim(rutaCompleta)
+    if StrLen(rutaLimpia) + 1 > longitudSlot {   ; +1 por el terminador nulo
+        MsgBox("La ruta completa excede la longitud máxima permitida para este slot.`n`n"
+             . "Máximo: " . (longitudSlot - 1) . " caracteres`n"
+             . "Su ruta: " . StrLen(rutaLimpia) . " caracteres", 
+             "Error - Ruta demasiado larga", "IconX")
+        return false
+    }
+
+    try {
+        archivo := FileOpen(rutaNATPARM, "rw")
+        if !archivo
+            throw Error("No se pudo abrir NATPARM.SAG para escritura")
+
+        archivo.Seek(offsetPath)
+
+        ; Escribir la ruta byte a byte
+        Loop StrLen(rutaLimpia) {
+            char := SubStr(rutaLimpia, A_Index, 1)
+            archivo.WriteUChar(Ord(char))
+        }
+
+        ; Terminador nulo
+        archivo.WriteUChar(0x00)
+
+        ; Rellenar el resto del slot con ceros
+        bytesEscritos := StrLen(rutaLimpia) + 1
+        if bytesEscritos < longitudSlot {
+            Loop longitudSlot - bytesEscritos {
+                archivo.WriteUChar(0x00)
+            }
+        }
+
+        archivo.Close()
+        return true
+
+    } catch as err {
+        MsgBox("Error al escribir workfile en NATPARM.SAG:`n" . err.Message, "Error", "IconX")
+        return false
+    }
+}
+
+; ===== FUNCIÓN: LEER MÁXIMO DE WORKFILES (patrón 00 54 00 04) =====
+; Busca el patrón 00 54 00 04 en NATPARM.SAG.
+; El byte inmediatamente ANTERIOR a ese patrón es el número máximo de Workfiles,
+; almacenado en formato hexadecimal (ej: 0x1E = 30, 0x20 = 32).
+; Guarda el offset de ese byte en workMaxOffset para poder escribirlo después.
+LeerMaxWorkfilesDeNATPARM() {
+    global versionNatural, workMaxOffset
+    rutaNATPARM := A_ScriptDir . "\dos\NATURAL\" . versionNatural . "\PROF\NATPARM.SAG"
+    workMaxOffset := 0
+    if !FileExist(rutaNATPARM)
+        return WORK_MAX_DEFAULT
+    try {
+        archivo := FileOpen(rutaNATPARM, "r")
+        if !archivo
+            return WORK_MAX_DEFAULT
+        tamaño := archivo.Length
+        buf    := Buffer(tamaño)
+        archivo.RawRead(buf, tamaño)
+        archivo.Close()
+        ; Buscar patrón 00 54 00 04 (no se repite en el archivo)
+        ; El valor buscado está en el byte ANTERIOR al patrón (offset - 1)
+        Loop tamaño - 4 {
+            i := A_Index - 1
+            if (NumGet(buf, i,     "UChar") = 0x00
+             && NumGet(buf, i + 1, "UChar") = 0x54
+             && NumGet(buf, i + 2, "UChar") = 0x00
+             && NumGet(buf, i + 3, "UChar") = 0x04) {
+                workMaxOffset := i - 1   ; byte justo ANTES del patrón
+                ; NumGet con "UChar" devuelve el byte como entero decimal sin signo.
+                ; Ejemplo: byte 0x1E en el archivo → valor = 30, byte 0x20 → valor = 32.
+                valor := NumGet(buf, workMaxOffset, "UChar")
+                ; Rango válido: 0 a 32 (0x00 a 0x20)
+                if (valor >= 0 && valor <= 32)
+                    return valor
+                ; Byte fuera de rango: usar default
+                return WORK_MAX_DEFAULT
+            }
+        }
+        ; Patrón 00 54 00 04 no encontrado en el archivo
+        return WORK_MAX_DEFAULT
+    } catch {
+        return WORK_MAX_DEFAULT
+    }
+}
+
+; ===== FUNCIÓN: ESCRIBIR MÁXIMO DE WORKFILES EN EL OFFSET DETECTADO =====
+; Escribe en el byte anterior al patrón 00 54 00 04, previamente localizado por LeerMaxWorkfilesDeNATPARM.
+EscribirMaxWorkfilesEnNATPARM(valor) {
+    global versionNatural, workMaxOffset
+    rutaNATPARM := A_ScriptDir . "\dos\NATURAL\" . versionNatural . "\PROF\NATPARM.SAG"
+    if !FileExist(rutaNATPARM) {
+        MsgBox("No se encontró NATPARM.SAG en:`n" . rutaNATPARM, "Error", "IconX")
+        return false
+    }
+    if workMaxOffset = 0 {
+        ; No se localizó el patrón 54 00 04 00 en NATPARM.SAG. No se puede guardar el máximo.
+        return false
+    }
+    try {
+        archivo := FileOpen(rutaNATPARM, "rw")
+        if !archivo
+            throw Error("No se pudo abrir NATPARM.SAG para escritura")
+        archivo.Seek(workMaxOffset)
+        archivo.WriteUChar(valor)   ; Guardado como byte hexadecimal
+        archivo.Close()
+        return true
+    } catch as err {
+        MsgBox("Error al escribir el máximo de workfiles en NATPARM.SAG:`n" . err.Message, "Error", "IconX")
+        return false
+    }
+}
+
+
+; =============================================================================
+;   VALIDACIÓN DE RUTAS WINDOWS 3.1 (formato 8.3)
+; =============================================================================
+
+; Nombres reservados del sistema que no pueden usarse
+global WF_NOMBRES_RESERVADOS := ["CON","PRN","AUX","NUL",
+    "COM1","COM2","COM3","COM4","COM5","COM6","COM7","COM8","COM9",
+    "LPT1","LPT2","LPT3","LPT4","LPT5","LPT6","LPT7","LPT8","LPT9"]
+
+; Caracteres especiales permitidos en nombres 8.3
+; (además de letras A-Z y dígitos 0-9)
+global WF_CHARS_PERMITIDOS := "_-!@#$%&'(){}^~"
+
+; ===== FUNCIÓN: Validar un segmento de nombre 8.3 (archivo o carpeta) =====
+; Devuelve "" si es válido, o un mensaje de error si no lo es.
+WF_ValidarSegmento83(segmento) {
+    global WF_NOMBRES_RESERVADOS, WF_CHARS_PERMITIDOS
+
+    if segmento = ""
+        return "El nombre no puede estar vacío."
+
+    ; Separar nombre base y extensión
+    puntoPos := InStr(segmento, ".")
+    if puntoPos > 0 {
+        base := SubStr(segmento, 1, puntoPos - 1)
+        ext  := SubStr(segmento, puntoPos + 1)
+    } else {
+        base := segmento
+        ext  := ""
+    }
+
+    ; El nombre no puede empezar con punto
+    if SubStr(segmento, 1, 1) = "."
+        return "El nombre no puede empezar con punto: '" . segmento . "'"
+
+    ; Longitud del nombre base: 1–8 caracteres
+    if StrLen(base) = 0
+        return "El nombre base no puede estar vacío en '" . segmento . "'"
+    if StrLen(base) > 8
+        return "El nombre base excede 8 caracteres: '" . base . "' (" . StrLen(base) . " caracteres)"
+
+    ; Longitud de la extensión: 0–3 caracteres
+    if StrLen(ext) > 3
+        return "La extensión excede 3 caracteres: '" . ext . "' (" . StrLen(ext) . " caracteres)"
+
+    ; Caracteres permitidos en nombre base y extensión
+    for parte in [base, ext] {
+        if parte = ""
+            continue
+        Loop StrLen(parte) {
+            c := SubStr(parte, A_Index, 1)
+            ; Letra A-Z/a-z, dígito, o carácter especial permitido
+            if !RegExMatch(c, "i)[A-Z0-9]") && !InStr(WF_CHARS_PERMITIDOS, c) {
+                return "Carácter no permitido '" . c . "' en '" . parte . "'"
+            }
+        }
+    }
+
+    ; Nombre reservado (comparar en mayúsculas, con y sin extensión)
+    baseMayus := StrUpper(base)
+    for reservado in WF_NOMBRES_RESERVADOS {
+        if baseMayus = reservado
+            return "Nombre reservado del sistema: '" . segmento . "'"
+    }
+
+    return ""   ; Válido
+}
+
+; ===== FUNCIÓN: Validar una ruta completa Windows 3.1 =====
+; Formato esperado: [Letra]:\[carpeta\...]rchivo.ext
+; Devuelve "" si es válida, o un mensaje de error descriptivo.
+WF_ValidarRuta31(ruta) {
+    ; Vacío = borrar entrada = permitido
+    if ruta = ""
+        return ""
+
+    ; Longitud máxima de la ruta completa: 51 caracteres
+    longitudRuta := StrLen(ruta)
+    if longitudRuta > 51
+        return "La ruta excede 51 caracteres (" . longitudRuta . "/51)."
+
+    ; No se permiten espacios
+    if InStr(ruta, " ")
+        return "Los espacios no están permitidos en rutas de Windows 3.1."
+
+    ; No se permiten barras hacia adelante
+    if InStr(ruta, "/")
+        return "Use barras invertidas (\) en lugar de barras (/)."
+
+    ; Debe comenzar con letra de unidad (A-Z/a-z) seguida de :\
+    primerChar  := SubStr(ruta, 1, 1)
+    segundoChar := SubStr(ruta, 2, 1)
+    tercerChar  := SubStr(ruta, 3, 1)
+    esLetra     := RegExMatch(primerChar, "i)[A-Z]")
+    if !esLetra || segundoChar != ":" || tercerChar != Chr(92)
+        return "La ruta debe comenzar con una letra de unidad seguida de :\ (ej. C:\CARPETA\ARCH.EXT)."
+
+
+    ; Separar en segmentos por barra invertida (quitar la letra de unidad + :\)
+    sinUnidad := SubStr(ruta, 4)
+    segmentos := StrSplit(sinUnidad, Chr(92))
+
+    ; Validar cada segmento (carpetas y archivo final) con reglas 8.3
+    for segmento in segmentos {
+        if segmento = ""
+            continue   ; ignorar dobles barras
+        errorSeg := WF_ValidarSegmento83(segmento)
+        if errorSeg != ""
+            return "'" . segmento . "': " . errorSeg
+    }
+
+    return ""   ; Ruta válida
+}
+
+MostrarGestionWorkfiles() {
+    global versionNatural, workfilesData, workMaxEntries, mainGui
+
+    ; Leer el máximo real desde la dirección 0x3D9
+    workMaxEntries := LeerMaxWorkfilesDeNATPARM()
+
+    ; Siempre leer los 32 slots posibles para que el array nunca quede vacío
+    workfilesData := LeerWorkfilesDeNATPARM(32)
+    while workfilesData.Length < 32
+        workfilesData.Push("")
+
+
+
+    ; ── Ocultar ventana principal (igual que al escanear) ─────────────────────
+    mainGui.Hide()
+
+    ; ── Crear ventana ─────────────────────────────────────────────────────────
+    wfGui := Gui("-MaximizeBox", "Administración de Archivos de Trabajo (WORK)")
+    wfGui.BackColor := "F0F0F0"
+    wfGui.SetFont("s11 c222222", "Segoe UI")
+
+    ; ── Barra de título interna (estilo imagen) ────────────────────────────────
+    ; Ancho de ventana: 950px
+    wfGui.SetFont("s11 bold cFFFFFF", "Segoe UI")
+    encTitle := wfGui.Add("Text", "x0 y0 w600 h28 Background1A237E", "")
+    titleLbl := wfGui.Add("Text", "x10 y6 w370 Background1A237E cFFFFFF", "Número Máximo de Archivos de Trabajo [WORK]")
+
+    ; Campo editable de cantidad máxima (en la barra azul, a la derecha)
+    wfGui.SetFont("s10 bold c000080", "Segoe UI")
+    txtMaxWF := wfGui.Add("Edit", "x440 y4 w40 h20 Border Center +Number", workMaxEntries)
+
+    ; Etiqueta aclaratoria del rango DESPUÉS del campo (a su derecha)
+    wfGui.SetFont("s9 cCCCCCC", "Segoe UI")
+    wfGui.Add("Text", "x485 y7 w100 Background1A237E cCCCCCC Left", "(0-32)")
+
+    ; ── Fila Number + Filename ─────────────────────────────────────────────────
+    wfGui.SetFont("s11 bold c222222", "Segoe UI")
+    wfGui.Add("Text", "x15 y40", "Número:")
+
+    wfGui.SetFont("s11 c222222", "Segoe UI")
+    txtNumber := wfGui.Add("Edit", "x85 y38 w50 h22 Border ReadOnly", "1")
+
+    wfGui.SetFont("s11 bold c222222", "Segoe UI")
+    wfGui.Add("Text", "x150 y40", "Ruta:")
+
+    wfGui.SetFont("s11 c222222", "Segoe UI")
+    txtFilename := wfGui.Add("Edit", "x230 y38 w350 h22 Border", "")
+
+    ; ── Separador ─────────────────────────────────────────────────────────────
+    wfGui.Add("Progress", "x15 y68 w565 h2 BackgroundCCCCCC -Smooth Disabled")
+
+    ; ── Encabezado de tabla ────────────────────────────────────────────────────
+    wfGui.SetFont("s10 bold c222222", "Segoe UI")
+    wfGui.Add("Text", "x15 y75", "Nr")
+    wfGui.Add("Text", "x60 y75", "Ruta en NATPARM.SAG")
+    ; (sin columna Archivo Importado)
+
+    ; ── ListView ──────────────────────────────────────────────────────────────
+    wfLV := wfGui.Add("ListView",
+        "x15 y95 w565 h280 -Multi -Hdr Grid NoSortHdr",
+        ["Nr", "Ruta en NATPARM.SAG"])
+
+    ; Poblar lista
+    Loop workMaxEntries {
+        nombre := (workfilesData.Length >= A_Index) ? workfilesData[A_Index] : ""
+        wfLV.Add("", A_Index, nombre)
+    }
+
+    wfLV.ModifyCol(1, "45 Left")    ; Nr
+    wfLV.ModifyCol(2, "500 Left")   ; Ruta NATPARM
+    ; (sin col3)
+
+    ; Seleccionar fila 1 al inicio (solo si hay filas)
+    if workMaxEntries > 0
+        wfLV.Modify(1, "Select Focus Vis")
+
+    ; ── Separador ─────────────────────────────────────────────────────────────
+    wfGui.Add("Progress", "x15 y383 w565 h2 BackgroundCCCCCC -Smooth Disabled")
+
+    ; ── Botones centrados ─────────────────────────────────────────────────────
+    ; Ventana 600px — 3 botones 110px + 2 gaps 20px = 370px → margen = 115
+    wfGui.SetFont("s10 c222222", "Segoe UI")
+    btnUpdate  := wfGui.Add("Button", "x115 y393 w110 h32", "&Actualizar")
+    btnImport  := wfGui.Add("Button", "x245 y393 w110 h32", Chr(0x1F4E5) . "  &Importar")
+    btnClose   := wfGui.Add("Button", "x375 y393 w110 h32", "&Cerrar")
+    ; ── Etiqueta de estado (debajo de los botones, centrada) ─────────────────
+    wfGui.SetFont("s10 bold c444444", "Segoe UI")
+    infoLbl := wfGui.Add("Text", "x15 y435 w565 Center", "")
+
+    ; ── Eventos ───────────────────────────────────────────────────────────────
+    wfLV.OnEvent("Click",      ActualizarCamposWF)
+    wfLV.OnEvent("ItemSelect", ActualizarCamposWF)
+    btnUpdate.OnEvent("Click", GuardarWorkfile)
+    btnImport.OnEvent("Click", ImportarWorkfile)
+    btnClose.OnEvent("Click",  CerrarWfGui)
+    wfGui.OnEvent("Close",     CerrarWfGui)
+
+    wfGui.Show("Center w600 h465")
+    ; Evitar que txtMaxWF aparezca seleccionado en azul al abrir
+    SendMessage(0xB1, -1, 0, txtMaxWF)   ; EM_SETSEL: deseleccionar
+
+    ; ── Función interna: cerrar subventana y restaurar ventana principal ───────
+    CerrarWfGui(*) {
+        wfGui.Destroy()
+        mainGui.Show()
+    }
+
+    ; ── Función interna: actualizar campos al hacer clic en una fila ──────────
+    ActualizarCamposWF(*) {
+        fila := wfLV.GetNext(0, "Focused")
+        if fila = 0
+            fila := wfLV.GetNext(0)
+        if fila = 0
+            return
+        txtNumber.Value   := fila
+        txtFilename.Value := wfLV.GetText(fila, 2)
+        ; Mover caret al final sin resaltar (evita azul de selección)
+        SendMessage(0xB1, 0, -1, txtFilename)   ; EM_SETSEL: seleccionar todo
+        SendMessage(0xB1, -1, 0, txtFilename)   ; EM_SETSEL: deseleccionar (caret al inicio)
+    }
+
+    ; ── Función interna: importar Workfile desde el sistema anfitrión ────────
+    ImportarWorkfile(*) {
+        ; Obtener fila seleccionada
+        fila := wfLV.GetNext(0, "Focused")
+        if fila = 0
+            fila := wfLV.GetNext(0)
+        if fila = 0 {
+            MsgBox("Seleccione primero un Workfile de la lista.", "Importar Workfile", "IconX")
+            return
+        }
+        if fila > workMaxEntries {
+            MsgBox("El número de fila (" . fila . ") supera el máximo (" . workMaxEntries . ").", "Importar Workfile", "IconX")
+            return
+        }
+
+        ; ── Seleccionar archivo desde el sistema anfitrión ───────────────────
+        archivoOrigen := FileSelect(1, "", "Seleccionar Workfile para importar", "Todos los archivos (*.*)")
+        if archivoOrigen = ""
+            return   ; cancelado
+
+        ; ── Extraer SOLO el nombre del archivo (sin la ruta) ─────────────────
+        nombreArchivo := RegExReplace(archivoOrigen, ".*[\\/]", "")
+        
+        ; ── Validar que el nombre del archivo cumpla reglas 8.3 ──────────────
+        errorValidacion := WF_ValidarSegmento83(nombreArchivo)
+        if errorValidacion != "" {
+            MsgBox("El nombre del archivo no cumple las reglas 8.3 de Windows 3.1:`n`n"
+                 . errorValidacion . "`n`n"
+                 . "Nombre: " . nombreArchivo, 
+                 "Error - Nombre de archivo inválido", "IconX")
+            return
+        }
+
+        ; ── Carpeta destino: .\dos\NATURAL\[version]\WF ──────────────────────
+        carpetaWF := A_ScriptDir . "\dos\NATURAL\" . versionNatural . "\WF"
+        if !DirExist(carpetaWF) {
+            try {
+                DirCreate(carpetaWF)
+            } catch as errDir {
+                MsgBox("No se pudo crear la carpeta destino:`n" . carpetaWF . "`n`n" . errDir.Message, "Error", "IconX")
+                return
+            }
+        }
+
+        ; ── Verificar si el archivo ya existe en destino ─────────────────────
+        rutaDestino := carpetaWF . "\" . nombreArchivo
+        if FileExist(rutaDestino) {
+            respuesta := MsgBox("El archivo ya existe en la carpeta WF.`n`n"
+                              . "¿Desea sobrescribirlo?", 
+                              "Archivo existente", "YesNo Icon?")
+            if respuesta = "No"
+                return
+        }
+
+        ; ── Copiar el archivo a la carpeta WF ────────────────────────────────
+        try {
+            FileCopy(archivoOrigen, rutaDestino, 1)  ; 1 = sobrescribir
+        } catch as errCopy {
+            MsgBox("Error al copiar el archivo:`n" . errCopy.Message, "Error", "IconX")
+            return
+        }
+
+        ; ── Construir la ruta COMPLETA que debe guardarse en NATPARM ─────────
+        ;    (con unidad y carpeta, exactamente como la espera Natural)
+        rutaCompleta := "C:\NATURAL\" . versionNatural . "\WF\" . nombreArchivo
+
+        ; ── Validar que la ruta completa quepa en el slot ────────────────────
+        if workfileLengths.Length >= fila && workfileLengths[fila] > 0 {
+            if StrLen(rutaCompleta) + 1 > workfileLengths[fila] {
+                MsgBox("La ruta completa excede la longitud máxima permitida para este slot.`n`n"
+                     . "Máximo: " . (workfileLengths[fila] - 1) . " caracteres`n"
+                     . "Ruta: " . rutaCompleta . " (" . StrLen(rutaCompleta) . " caracteres)", 
+                     "Error - Ruta demasiado larga", "IconX")
+                return
+            }
+        }
+
+        ; ── Escribir la RUTA COMPLETA en NATPARM.SAG ─────────────────────────
+        wfGuardado := false
+        if workfileOffsets.Length >= fila && workfileOffsets[fila] > 0 {
+            wfGuardado := EscribirWorkfileEnNATPARM(fila, rutaCompleta)
+        } else {
+            MsgBox("No se encontró el offset para el Workfile #" . fila . " en NATPARM.SAG.`n"
+                 . "No se actualizará la entrada.", 
+                 "Advertencia", "Icon!")
+        }
+
+        ; ── Actualizar ListView y memoria ────────────────────────────────────
+        while workfilesData.Length < fila
+            workfilesData.Push("")
+        workfilesData[fila] := rutaCompleta
+        
+        wfLV.Modify(fila, "Col2", rutaCompleta)
+        
+        txtNumber.Value   := fila
+        txtFilename.Value := rutaCompleta
+        SendMessage(0xB1, -1, 0, txtFilename)
+
+        ; ── Mensaje de estado ────────────────────────────────────────────────
+        if wfGuardado {
+            infoLbl.Value := "✓ Workfile #" . fila . " importado → " . nombreArchivo . " guardado con ruta completa"
+            infoLbl.Opt("c006600")
+        } else {
+            infoLbl.Value := "⚠ Archivo copiado a WF\ pero no se actualizó NATPARM.SAG"
+            infoLbl.Opt("c996600")
+        }
+    }
+
+    ; ── Función interna: guardar (Update) ─────────────────────────────────────
+    GuardarWorkfile(*) {
+
+        ; ── 1. Validar y guardar el MÁXIMO (campo txtMaxWF) ───────────────────
+        maxStr := Trim(txtMaxWF.Value)
+        if !RegExMatch(maxStr, "^\d+$") || Integer(maxStr) < 0 || Integer(maxStr) > 32 {
+            MsgBox("El valor máximo '" . maxStr . "' no es válido.`n"
+                 . "Debe ser un número entero entre 0 y 32.", "Error — Máximo de Workfiles", "IconX")
+            txtMaxWF.Focus()
+            return
+        }
+        nuevoMax := Integer(maxStr)
+
+        ; Guardar en 0x3D9 como byte hexadecimal
+        maxGuardado := EscribirMaxWorkfilesEnNATPARM(nuevoMax)
+
+        ; Si el máximo cambió, actualizar la lista y el array en memoria
+        if nuevoMax != workMaxEntries {
+            workMaxEntries := nuevoMax
+            ; Asegurar que workfilesData tiene suficientes slots
+            while workfilesData.Length < workMaxEntries
+                workfilesData.Push("")
+            wfLV.Delete()
+            Loop workMaxEntries {
+                wfLV.Add("", A_Index, workfilesData[A_Index])
+            }
+            wfLV.ModifyCol(1, "45 Left")
+            wfLV.ModifyCol(2, "500 Left")
+            if workMaxEntries > 0 {
+                wfLV.Modify(1, "Select Focus Vis")
+                txtNumber.Value   := 1
+                txtFilename.Value := workfilesData[1]
+            }
+        }
+
+        ; ── 2. Validar y guardar el FILENAME de la fila seleccionada ──────────
+        filaStr := Trim(txtNumber.Value)
+        if !RegExMatch(filaStr, "^\d+$") || Integer(filaStr) < 1 || Integer(filaStr) > workMaxEntries {
+            ; Si el número de fila no aplica (p.ej. max=0) solo reportar el max
+            if maxGuardado {
+                infoLbl.Value := "✓ Actualizado correctamente"
+                infoLbl.Opt("c006600")
+            } else {
+                infoLbl.Value := "✗ Error al actualizar"
+                infoLbl.Opt("c800000")
+            }
+            return
+        }
+
+        fila  := Integer(filaStr)
+        path  := Trim(txtFilename.Value)
+
+        ; Validar ruta con reglas completas de Windows 3.1 (formato 8.3)
+        errorRuta := WF_ValidarRuta31(path)
+        if errorRuta != "" {
+            MsgBox("Ruta inválida para Windows 3.1:`n`n" . errorRuta
+                 . "`n`nEjemplo válido: C:\NATAPPS\WORK1.WRK", "Error — Ruta de Workfile", "IconX")
+            txtFilename.Focus()
+            return
+        }
+
+        ; Verificar que no exceda la longitud del slot original (para no corromper NATPARM.SAG)
+        longitudOrig := (workfileLengths.Length >= fila && workfileLengths[fila] > 0)
+                       ? workfileLengths[fila] : 51
+        if StrLen(path) > longitudOrig {
+            MsgBox("La ruta excede la longitud máxima permitida para este slot ("
+                 . longitudOrig . " caracteres).", "Error — Ruta demasiado larga", "IconX")
+            txtFilename.Focus()
+            return
+        }
+
+        nombre := path   ; Alias para compatibilidad con el resto del código
+
+        ; Actualizar ListView y memoria
+        wfLV.Modify(fila, "", fila, nombre)
+        ; Extender el array si es necesario (evita "Invalid index")
+        while workfilesData.Length < fila
+            workfilesData.Push("")
+        workfilesData[fila] := nombre
+
+        ; Escribir workfile en NATPARM.SAG
+        wfGuardado := false
+        if workfileOffsets.Length >= fila && workfileOffsets[fila] > 0
+            wfGuardado := EscribirWorkfileEnNATPARM(fila, nombre)
+
+        ; ── Mensaje de estado combinado ────────────────────────────────────────
+        if maxGuardado && (workfileOffsets.Length >= fila && workfileOffsets[fila] > 0 ? wfGuardado : true) {
+            infoLbl.Value := "✓ Actualizado correctamente"
+            infoLbl.Opt("c006600")
+        } else {
+            infoLbl.Value := "✗ Error al actualizar"
+            infoLbl.Opt("c800000")
+        }
+
+        ; Avanzar selección a la siguiente fila
+        if workMaxEntries > 0 {
+            siguiente := Min(fila + 1, workMaxEntries)
+            wfLV.Modify(siguiente, "Select Focus Vis")
+            txtNumber.Value   := siguiente
+            ; workfilesData siempre tiene al menos 32 slots, acceso seguro
+            txtFilename.Value := workfilesData[siguiente]
+        }
+    }
+}
+
+; ===== FUNCIÓN: OBTENER RUTA DE DESTINO SEGÚN VERSIÓN =====
+ObtenerRutaDestino() {
+    global versionNatural, libreriaDefecto
+    
+    rutaBase := ".\dos\NATAPPS"
+    
+    ; Determinar estructura según versión
+    if (versionNatural = "210" || versionNatural = "211" || versionNatural = "212") {
+        ; Versiones 2.1.0, 2.1.1, 2.1.2: guardar directamente en NATAPPS
+        return rutaBase . "\" . libreriaDefecto
+    } else {
+        ; Versiones 2.1.3+: usar estructura FUSER\SRC
+        return rutaBase . "\FUSER\" . libreriaDefecto . "\SRC"
+    }
 }
 
 ; ===== FUNCIÓN: ACTUALIZAR DESTINO =====
 ActualizarDestino() {
-    global txtLibreria, destinoBase, libreriaDefecto, mainGui
+    global txtLibreria, destinoBase, libreriaDefecto, mainGui, versionNatural
     
     ; Verificar si la ventana principal está minimizada o inactiva
-    ; Si es así, no validar (para evitar mensaje al minimizar)
     try {
         if !WinActive("ahk_id " . mainGui.Hwnd)
             return
@@ -277,14 +1240,14 @@ ActualizarDestino() {
     ; Si está vacío, restaurar valor por defecto sin mensaje
     if libreria = "" {
         txtLibreria.Value := libreriaDefecto
-        destinoBase := ".\dos\NATAPPS\FUSER\" . libreriaDefecto . "\SRC"
+        destinoBase := ObtenerRutaDestino()
         return
     }
     
     ; Convertir a mayúsculas
     libreria := StrUpper(libreria)
     
-    ; Validar reglas de Natural
+    ; Validar reglas de Natural (ya filtrado, pero por si acaso)
     errores := []
     
     ; Verificar que solo contenga caracteres válidos (A-Z, 0-9, -, #)
@@ -295,6 +1258,11 @@ ActualizarDestino() {
     ; Verificar que empiece con letra o numeral
     if !RegExMatch(libreria, "^[A-Z#]") {
         errores.Push("- Debe empezar con una letra (A-Z) o numeral (#)")
+    }
+    
+    ; Verificar longitud (máximo 8)
+    if StrLen(libreria) > 8 {
+        errores.Push("- No puede exceder 8 caracteres")
     }
     
     ; Si hay errores, mostrar mensaje y restaurar valor anterior
@@ -309,7 +1277,7 @@ ActualizarDestino() {
         
         ; Restaurar valor por defecto
         txtLibreria.Value := libreriaDefecto
-        destinoBase := ".\dos\NATAPPS\FUSER\" . libreriaDefecto . "\SRC"
+        destinoBase := ObtenerRutaDestino()
         
         ; Dar foco de nuevo al campo para que el usuario lo corrija
         txtLibreria.Focus()
@@ -318,7 +1286,16 @@ ActualizarDestino() {
     
     ; Si pasó todas las validaciones, actualizar
     txtLibreria.Value := libreria
-    destinoBase := ".\dos\NATAPPS\FUSER\" . libreria . "\SRC"
+    libreriaDefecto := libreria
+    destinoBase := ObtenerRutaDestino()
+}
+
+; ===== FUNCIÓN AUXILIAR: Habilitar botón escanear solo si hay ruta Y librería =====
+ActualizarEstadoBotonEscanear() {
+    global rutaOrigen, txtLibreria, btnEscanear
+    tieneRuta     := (rutaOrigen != "")
+    tieneLibreria := (Trim(txtLibreria.Value) != "")
+    btnEscanear.Enabled := (tieneRuta && tieneLibreria)
 }
 
 ; ===== FUNCIÓN: SELECCIONAR RUTA PREDEFINIDA =====
@@ -328,7 +1305,7 @@ SeleccionarRuta(ruta) {
     if DirExist(ruta) {
         rutaOrigen := ruta
         txtRutaActual.Value := ruta
-        btnEscanear.Enabled := true
+        ActualizarEstadoBotonEscanear()
         esCarpetaPersonalizada := false  ; Es Workspace o Git, NO personalizada
         
         ; Extraer nombre de la carpeta para mostrar después
@@ -355,7 +1332,7 @@ SeleccionarRutaPersonalizada() {
     if carpeta != "" {
         rutaOrigen := carpeta
         txtRutaActual.Value := carpeta
-        btnEscanear.Enabled := true
+        ActualizarEstadoBotonEscanear()
         esCarpetaPersonalizada := true  ; Es carpeta personalizada
         
         ; Extraer nombre de la carpeta seleccionada
@@ -371,10 +1348,16 @@ SeleccionarRutaPersonalizada() {
 
 ; ===== FUNCIÓN: ESCANEAR ARCHIVOS =====
 EscanearArchivos() {
-    global archivosEncontrados, rutaOrigen, mainGui
+    global archivosEncontrados, rutaOrigen, mainGui, txtLibreria
     
     if rutaOrigen = "" {
         MsgBox("Por favor, seleccione primero una carpeta de origen.", "Error", "IconX")
+        return
+    }
+    
+    if Trim(txtLibreria.Value) = "" {
+        MsgBox("Por favor, ingrese una librería de destino antes de escanear.", "Librería requerida", "IconX")
+        txtLibreria.Focus()
         return
     }
     
@@ -439,7 +1422,7 @@ MostrarVentanaSeleccion() {
     ; =============================================
     ;     VENTANA DE SELECCIÓN - ESTILO MODERNO
     ; =============================================
-    selGui := Gui("+Resize +MinSize800x580", "Seleccionar Objetos Natural para Migrar")
+    selGui := Gui("-MaximizeBox +MinSize800x580", "Seleccionar Objetos Natural para Migrar")
     selGui.BackColor := "F8F9FA"          ; Fondo muy claro
     selGui.SetFont("s12 c333333", "Segoe UI")
 
@@ -454,15 +1437,8 @@ MostrarVentanaSeleccion() {
     ; ────────────────────────────────────────────
     ;               LISTVIEW PRINCIPAL
     ; ────────────────────────────────────────────
-    ; Definir columnas según el tipo de carpeta
-    if esCarpetaPersonalizada {
-        ; Sin columna PROYECTO para carpetas personalizadas
-        ; listView := selGui.Add("ListView", "x30 y100 w740 h400 Checked -Multi Grid", ["    NOMBRE", "TIPO", "TAMAÑO", "FECHA"])
-		listView := selGui.Add("ListView", "x30 y100 w740 h400 Checked -Multi Grid", ["    NOMBRE", "TIPO", "TAMAÑO", "FECHA", "PROYECTO"])
-    } else {
-        ; Con columna PROYECTO para Workspace/Git
-        listView := selGui.Add("ListView", "x30 y100 w740 h400 Checked -Multi Grid", ["    NOMBRE", "TIPO", "TAMAÑO", "FECHA", "PROYECTO"])
-    }
+    ; ListView con columnas fijas (PROYECTO aplica tanto a Workspace/Git como a carpeta personalizada)
+    listView := selGui.Add("ListView", "x30 y100 w740 h400 Checked Grid", ["    NOMBRE", "TIPO", "TAMAÑO", "FECHA", "PROYECTO"])
     listView.SetFont("s10", "Segoe UI")
 
     ; Poblar ListView con validación de nombres
@@ -533,18 +1509,19 @@ MostrarVentanaSeleccion() {
     btnDeselTodos.Opt("+BackgroundE53935")   ; Rojo suave
     btnDeselTodos.SetFont("s10 cFFFFFF", "Segoe UI")
 
-    ; Contador de seleccionados (con fondo destacado)
-    txtContador := selGui.Add("Text", "x420 y528 w200 c0D47A1", "Seleccionados: 0")
-    txtContador.SetFont("s11 bold", "Segoe UI")
-
-    ; Botones principales (Volver y Copiar)
-    btnVolver := selGui.Add("Button", "x590 y520 w90 h45", "  ←  Volver")
+    ; Contador de seleccionados — se agrega DESPUÉS de los botones para que quede
+    ; por encima en el orden Z y no provoque borrado visual al actualizarse
+    btnVolver := selGui.Add("Button", "x560 y520 w100 h45", "  ←  Volver")
     btnVolver.Opt("+Background607D8B")   ; Gris azulado
     btnVolver.SetFont("s10 cFFFFFF", "Segoe UI")
 
-    btnCopiar := selGui.Add("Button", "x700 y520 w90 h45", "📋  COPIAR")
+    btnCopiar := selGui.Add("Button", "x670 y520 w100 h45", "📋  COPIAR")
     btnCopiar.Opt("+BackgroundFF5722")   ; Naranja acción
     btnCopiar.SetFont("s10 bold cFFFFFF", "Segoe UI")
+
+    ; txtContador se crea AL FINAL para que su redibujado no tape los botones
+    txtContador := selGui.Add("Text", "x420 y533 w130 BackgroundF8F9FA c0D47A1", "Seleccionados: 0")
+    txtContador.SetFont("s11 bold", "Segoe UI")
 
     ; ────────────────────────────────────────────
     ;               EVENTOS
@@ -556,6 +1533,13 @@ MostrarVentanaSeleccion() {
 
     listView.OnEvent("ItemCheck", (*) => ActualizarContador())
 
+    ; Hook para Shift+Click: subclassing del control ListView
+    global lvUltimoClick := 0
+    global lvProcOrig := 0
+    lvHwnd := listView.Hwnd
+    lvProcOrig := DllCall("SetWindowLongPtr", "Ptr", lvHwnd, "Int", -4,
+                          "Ptr", CallbackCreate(LV_ShiftClickProc, , 4), "Ptr")
+
     selGui.OnEvent("Close", (*) => VolverAlMenu(selGui))
 
     selGui.Show("Center w800 h600")
@@ -565,8 +1549,9 @@ MostrarVentanaSeleccion() {
 ActualizarContador() {
     global listView, txtContador
     
+    totalEnLista := listView.GetCount()   ; Solo los ítems válidos visibles en el ListView
     contador := 0
-    Loop listView.GetCount() {
+    Loop totalEnLista {
         if listView.GetNext(A_Index - 1, "Checked") = A_Index
             contador++
     }
@@ -574,7 +1559,7 @@ ActualizarContador() {
     txtContador.Value := "Seleccionados: " . contador
     if (contador = 0)
         txtContador.Opt("c555555")
-    else if (contador = archivosEncontrados.Length)
+    else if (contador = totalEnLista)
         txtContador.Opt("c2E7D32")   ; verde cuando todos están seleccionados
     else
         txtContador.Opt("c0D47A1")   ; azul cuando hay selección parcial
@@ -589,9 +1574,71 @@ SeleccionarTodos(estado) {
     ActualizarContador()
 }
 
+; ===== FUNCIÓN: SHIFT+CLICK EN LISTVIEW (via subclassing) =====
+; Intercepta WM_LBUTTONDOWN sobre el ListView para detectar Shift+Click
+; y marcar/desmarcar el rango entre el último ítem clickeado y el actual.
+LV_ShiftClickProc(hwnd, msg, wParam, lParam) {
+    global listView, lvUltimoClick, lvProcOrig
+
+    ; Solo interceptar WM_LBUTTONDOWN (0x0201)
+    if msg != 0x0201
+        return DllCall("CallWindowProc", "Ptr", lvProcOrig, "Ptr", hwnd,
+                       "UInt", msg, "Ptr", wParam, "Ptr", lParam, "Ptr")
+
+    ; Determinar qué fila fue clickeada mediante LVM_HITTEST (0x1012)
+    ; Construir estructura LVHITTESTINFO: x (Int32) + y (Int32) + flags (UInt32) + iItem (Int32)
+    htInfo := Buffer(24, 0)
+    NumPut("Int", lParam & 0xFFFF,        htInfo, 0)   ; x
+    NumPut("Int", (lParam >> 16) & 0xFFFF, htInfo, 4)  ; y
+    filaHit := DllCall("SendMessage", "Ptr", hwnd, "UInt", 0x1012, "Ptr", 0, "Ptr", htInfo.Ptr, "Ptr") + 1
+
+    ; Si no se clickeó ninguna fila válida, comportamiento normal
+    if filaHit <= 0 {
+        lvUltimoClick := 0
+        return DllCall("CallWindowProc", "Ptr", lvProcOrig, "Ptr", hwnd,
+                       "UInt", msg, "Ptr", wParam, "Ptr", lParam, "Ptr")
+    }
+
+    ; Si Shift NO está presionado: guardar fila y comportamiento normal
+    if !GetKeyState("Shift", "P") {
+        lvUltimoClick := filaHit
+        return DllCall("CallWindowProc", "Ptr", lvProcOrig, "Ptr", hwnd,
+                       "UInt", msg, "Ptr", wParam, "Ptr", lParam, "Ptr")
+    }
+
+    ; Shift+Click: aplicar rango desde lvUltimoClick hasta filaHit
+    desde := lvUltimoClick > 0 ? lvUltimoClick : filaHit
+    hasta  := filaHit
+
+    ; Ordenar rango
+    if desde > hasta {
+        tmp  := desde
+        desde := hasta
+        hasta := tmp
+    }
+
+    ; El estado de referencia es el OPUESTO al estado actual de filaHit:
+    ; si el ítem clickeado está marcado → el Shift+Click lo desmarca (y al rango también)
+    ; si está desmarcado → lo marca (y al rango también)
+    ; Esto replica exactamente el comportamiento nativo de Windows
+    estaCheckeado := (listView.GetNext(filaHit - 1, "Checked") = filaHit)
+    estadoRef     := !estaCheckeado
+
+    ; Aplicar ese estado a todo el rango
+    Loop (hasta - desde + 1) {
+        listView.Modify(desde + A_Index - 1, estadoRef ? "Check" : "-Check")
+    }
+
+    lvUltimoClick := filaHit
+    ActualizarContador()
+
+    ; Retornar 0 para suprimir el comportamiento por defecto del click
+    return 0
+}
+
 ; ===== FUNCIÓN: COPIAR ARCHIVOS SELECCIONADOS =====
 CopiarArchivosSeleccionados(ventana) {
-    global listView, archivosEncontrados, destinoBase
+    global listView, archivosEncontrados, destinoBase, versionNatural
     
     ; Contar seleccionados
     archivosCopiar := []
@@ -606,17 +1653,45 @@ CopiarArchivosSeleccionados(ventana) {
         return
     }
     
-    ; Confirmar - mostrar ruta con librería actualizada
+    ; Obtener ruta de destino actualizada
+    destinoBase := ObtenerRutaDestino()
+    
+    ; Mostrar información según versión
+    versionFormateada := FormatearVersion(versionNatural)
     libreriaActual := Trim(txtLibreria.Value)
-    rutaCompletaConLibreria := ".\dos\NATAPPS\FUSER\" . libreriaActual . "\SRC"
-    respuesta := MsgBox("¿Desea copiar " . archivosCopiar.Length . " archivo(s) a:`n`n" . rutaCompletaConLibreria . "`n`nLibrería: " . libreriaActual . "`n`nSe eliminarán automáticamente los encabezados de NaturalONE.", "Confirmar", "YesNo Icon?")
+    
+    mensajeConfirmacion := "¿Desea copiar " . archivosCopiar.Length . " archivo(s) a:`n`n"
+    mensajeConfirmacion .= destinoBase . "`n`n"
+    mensajeConfirmacion .= "Librería: " . libreriaActual . "`n"
+    mensajeConfirmacion .= "Versión Natural: " . versionFormateada . "`n"
+    
+    mensajeConfirmacion .= "`nSe eliminarán automáticamente los encabezados de NaturalONE."
+    
+    respuesta := MsgBox(mensajeConfirmacion, "Confirmar", "YesNo Icon?")
     if respuesta = "No"
         return
     
-    ; Crear directorio destino si no existe
+    ; Crear directorios necesarios según la versión
     if !DirExist(destinoBase) {
         try {
-            DirCreate(destinoBase)
+            ; Para versiones antiguas, crear solo la carpeta de librería
+            if (versionNatural = "210" || versionNatural = "211" || versionNatural = "212") {
+                DirCreate(destinoBase)
+            } else {
+                ; Para versiones nuevas, crear toda la estructura FUSER\LIBRERIA\SRC
+                rutaNATAPPS := ".\dos\NATAPPS"
+                rutaFUSER := rutaNATAPPS . "\FUSER"
+                rutaLibreria := rutaFUSER . "\" . libreriaActual
+                
+                if !DirExist(rutaNATAPPS)
+                    DirCreate(rutaNATAPPS)
+                if !DirExist(rutaFUSER)
+                    DirCreate(rutaFUSER)
+                if !DirExist(rutaLibreria)
+                    DirCreate(rutaLibreria)
+                if !DirExist(destinoBase)
+                    DirCreate(destinoBase)
+            }
         } catch as err {
             MsgBox("Error al crear el directorio destino:`n" . err.Message, "Error", "IconX")
             return
@@ -624,7 +1699,6 @@ CopiarArchivosSeleccionados(ventana) {
     } else {
         ; Si existe, borrar todo el contenido anterior
         try {
-            ; Borrar TODOS los archivos en el directorio
             Loop Files, destinoBase . "\*" {
                 FileDelete(A_LoopFileFullPath)
             }
@@ -700,6 +1774,7 @@ CopiarArchivosSeleccionados(ventana) {
         
         ; Escribir librería en NATPARM.SAG
         libreriaActual := Trim(txtLibreria.Value)
+        libreriaEscrita := false  ; Inicializar antes del bloque condicional
         if libreriaActual != "" {
             if EscribirLibreriaEnNATPARM(libreriaActual) {
                 libreriaEscrita := true
@@ -749,9 +1824,20 @@ CopiarArchivosSeleccionados(ventana) {
 
 ; ===== FUNCIÓN: GENERAR FILEDIR.SAG =====
 GenerarFILEDIRSAG(archivos) {
-    global destinoBase
+    global destinoBase, versionNatural
     
     try {
+		; Determinar dónde guardar FILEDIR.SAG según versión
+        if (versionNatural = "210" || versionNatural = "211" || versionNatural = "212") {
+            ; Versiones antiguas: FILEDIR.SAG va en la carpeta de librería
+            rutaNATUSER := destinoBase  ; Ya es .\dos\NATAPPS\LIBRERIA
+        } else {
+            ; Versiones nuevas: FILEDIR.SAG va en NATUSER (sin \SRC)
+            rutaNATUSER := StrReplace(destinoBase, "\SRC", "")
+        }
+        
+        archivoSAG := rutaNATUSER . "\FILEDIR.SAG"
+	
         ; Preparar lista de objetos ordenados alfabéticamente
         objetosParaFILEDIR := []
         
@@ -865,11 +1951,8 @@ GenerarFILEDIRSAG(archivos) {
                 }
             }
             
-            ; Últimos 4 bytes del bloque de nombre: 00 00 00 00
+            ; Último byte del bloque de nombre: 00
               file.WriteUChar(0x00)
-            ; file.WriteUChar(0x00)
-            ; file.WriteUChar(0x00)
-            ; file.WriteUChar(0x00)
             
             ; --- Offset después del nombre (ahora ajustado) ---
             ; Rellenar hasta llegar al offset 0x20 (donde va el nombre físico)
@@ -1809,12 +2892,16 @@ ParsearCampoNatural(linea, nivelEstructuraActual := 0) {
 
 ; ===== FUNCIÓN: VOLVER AL MENÚ =====
 VolverAlMenu(ventana) {
-    global rutaOrigen, txtLibreria, destinoBase
+    global rutaOrigen, txtLibreria, destinoBase, lvProcOrig, lvUltimoClick
     
     ; Guardar valores actuales
     rutaOrigenPreservada := rutaOrigen
     libreriaPreservada := txtLibreria.Value
     
+    ; Limpiar el subclassing del ListView antes de destruir la ventana
+    lvProcOrig    := 0
+    lvUltimoClick := 0
+
     ventana.Destroy()
     MostrarMenuPrincipal()
     
@@ -1823,13 +2910,13 @@ VolverAlMenu(ventana) {
         global txtRutaActual, btnEscanear
         rutaOrigen := rutaOrigenPreservada
         txtRutaActual.Value := rutaOrigenPreservada
-        btnEscanear.Enabled := true
+        ActualizarEstadoBotonEscanear()
     }
     
     if libreriaPreservada != "" {
         txtLibreria.Value := libreriaPreservada
         ; Actualizar destinoBase manualmente
-        destinoBase := ".\dos\NATAPPS\FUSER\" . libreriaPreservada . "\SRC"
+        destinoBase := ObtenerRutaDestino()
     }
 }
 
@@ -2305,4 +3392,60 @@ GenerarLineaConInicializacion(resultado, esConstante, valorInicializacion) {
     resultadoFinal := SubStr(resultadoFinal, 1, -1)
     
     return resultadoFinal
+}
+
+; ===== FUNCIÓN: FILTRAR LIBRERÍA EN TIEMPO REAL (permite borrar todo) =====
+FiltrarLibreria(ctrl, *) {
+    global libreriaDefecto
+    
+    texto := ctrl.Value
+    
+    ; Guardar posición actual del cursor ANTES de cualquier modificación
+    ; EM_GETSEL (0xB0): wParam y lParam reciben inicio y fin de selección
+    cursorPos := SendMessage(0xB0, 0, 0, ctrl) & 0xFFFF   ; byte bajo = inicio de selección
+    
+    ; Convertir a mayúsculas
+    textoUpper := StrUpper(texto)
+    
+    ; Filtrar caracteres válidos, rastreando cuántos se eliminaron ANTES del cursor
+    nuevo := ""
+    eliminadosAntesCursor := 0
+    Loop Parse, textoUpper {
+        posChar := A_Index   ; posición 1-based en el texto original
+        esValido := RegExMatch(A_LoopField, "[A-Z0-9#-]")
+        if esValido {
+            nuevo .= A_LoopField
+        } else {
+            ; Si el carácter inválido estaba antes o en el cursor, ajustar
+            if posChar <= cursorPos
+                eliminadosAntesCursor++
+        }
+    }
+    
+    ; Máximo 8 caracteres
+    if StrLen(nuevo) > 8
+        nuevo := SubStr(nuevo, 1, 8)
+    
+    ; Primer carácter debe ser A-Z o #
+    primerEliminado := 0
+    if (nuevo != "" && !RegExMatch(SubStr(nuevo, 1, 1), "^[A-Z#]$")) {
+        nuevo := SubStr(nuevo, 2)   ; quitar primer carácter inválido
+        primerEliminado := 1
+    }
+    
+    ; Aplicar el texto filtrado solo si cambió
+    if (ctrl.Value != nuevo) {
+        ctrl.Value := nuevo
+    }
+    
+    ; Restaurar cursor en la posición correcta, descontando caracteres eliminados
+    nuevoCursor := cursorPos - eliminadosAntesCursor - primerEliminado
+    if nuevoCursor < 0
+        nuevoCursor := 0
+    if nuevoCursor > StrLen(nuevo)
+        nuevoCursor := StrLen(nuevo)
+    SendMessage(0xB1, nuevoCursor, nuevoCursor, ctrl)
+    
+    ; Actualizar estado del botón escanear según librería
+    ActualizarEstadoBotonEscanear()
 }
