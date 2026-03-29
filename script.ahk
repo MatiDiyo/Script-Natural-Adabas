@@ -2002,7 +2002,7 @@ MostrarVentanaSeleccion() {
     ; ────────────────────────────────────────────
     ;               LISTVIEW PRINCIPAL
     ; ────────────────────────────────────────────
-    listView := selGui.Add("ListView", "x30 y85 w740 h415 Checked Grid", ["    NOMBRE", "TIPO", "TAMAÑO", "FECHA"])
+    listView := selGui.Add("ListView", "x30 y85 w740 h415 Checked Grid", ["    NOMBRE", "TIPO", "TAMAÑO", "FECHA", "__RUTA__"])
     listView.SetFont("s10", "Segoe UI")
 
     ; Poblar ListView con validación de nombres
@@ -2016,7 +2016,7 @@ MostrarVentanaSeleccion() {
         fechaFormateada := FormatTime(fechaModif, "dd/MM/yyyy")
         tipoObjeto := ConvertirExtensionATipo(archivo.ext)
 
-        listView.Add("", archivo.nombre, tipoObjeto, tamanoKB, fechaFormateada)
+        listView.Add("", archivo.nombre, tipoObjeto, tamanoKB, fechaFormateada, archivo.ruta)
         archivosValidos.Push(archivo)
     }
 
@@ -2024,6 +2024,7 @@ MostrarVentanaSeleccion() {
     listView.ModifyCol(2, "130 Left")   ; Tipo
     listView.ModifyCol(3, "100 Left")   ; Tamaño
     listView.ModifyCol(4, "160 Left")   ; Fecha
+    listView.ModifyCol(5, "0")          ; Ruta — columna oculta
 
     ; ────────────────────────────────────────────
     ; BARRA DE ACCIONES INFERIOR
@@ -2170,11 +2171,19 @@ LV_ShiftClickProc(hwnd, msg, wParam, lParam) {
 CopiarArchivosSeleccionados(ventana) {
     global listView, archivosEncontrados, archivosValidos, destinoBase, versionNatural
     
-    ; Contar seleccionados — usar archivosValidos (mismo orden que el ListView)
+    ; Contar seleccionados — leer ruta desde columna oculta para respetar el orden de sort
     archivosCopiar := []
     Loop listView.GetCount() {
-        if listView.GetNext(A_Index - 1, "Checked") = A_Index
-            archivosCopiar.Push(archivosValidos[A_Index])
+        if listView.GetNext(A_Index - 1, "Checked") = A_Index {
+            rutaFila := listView.GetText(A_Index, 5)
+            ; Buscar el objeto correspondiente en archivosValidos por ruta
+            for av in archivosValidos {
+                if av.ruta = rutaFila {
+                    archivosCopiar.Push(av)
+                    break
+                }
+            }
+        }
     }
     
     if archivosCopiar.Length = 0 {
@@ -2267,6 +2276,16 @@ CopiarArchivosSeleccionados(ventana) {
             resultado := LimpiarEncabezadosNatural(contenidoOriginal)
             contenidoLimpio := resultado.contenido
             lineasEliminadas := resultado.lineasEliminadas
+
+            ; Traducir asignaciones := a COMPUTE = en objetos de código
+            extUpper := StrUpper(archivo.ext)
+            if (extUpper = "NSP" || extUpper = "NSN" || extUpper = "NSS"
+             || extUpper = "NSC" || extUpper = "NSH" || extUpper = "NST") {
+                contenidoLimpio := TraducirAsignaciones(contenidoLimpio)
+                contenidoLimpio := EliminarDefineWorkFile(contenidoLimpio)
+                contenidoLimpio := TraducirDefineWindow(contenidoLimpio)
+                contenidoLimpio := LimpiarTiposEnView(contenidoLimpio)
+            }
             
             ; Si es un área de datos (.NSL, .NSG, .NSA), procesar estructura especial
             esAreaDatos := InStr(archivo.ext, "NSL") || InStr(archivo.ext, "NSG") || InStr(archivo.ext, "NSA")
@@ -2671,6 +2690,244 @@ OrdenarObjetosAlfabeticamente(objetos) {
     return objetos
 }
 
+; ===== FUNCIÓN: TRADUCIR DEFINE WINDOW A SET CONTROL =====
+TraducirDefineWindow(contenido) {
+    lineas := StrSplit(contenido, "`n")
+
+    ; ── Paso 1: recolectar todos los bloques DEFINE WINDOW ───────────────────
+    ; ventanas es un Map: nombre → {control: "WB...", lineasBloque: [índices]}
+    ventanas := Map()
+    i := 1
+    while i <= lineas.Length {
+        linea := lineas[i]
+
+        ; Ignorar líneas comentadas
+        if SubStr(linea, 1, 1) = "*" {
+            i++
+            continue
+        }
+
+        ; Detectar inicio de bloque DEFINE WINDOW
+        if RegExMatch(Trim(linea), "^DEFINE\s+WINDOW\s+(\S+)", &m) {
+            nombreVentana := StrUpper(m[1])
+            columnas := ""
+            filas    := ""
+            baseVal  := ""
+            framed   := false
+            lineasBloque := [i]   ; índice de la línea DEFINE WINDOW
+
+            ; Leer las siguientes líneas del bloque (SIZE, BASE, FRAMED)
+            j := i + 1
+            while j <= lineas.Length {
+                lb := Trim(lineas[j])
+                if SubStr(lineas[j], 1, 1) = "*" {
+                    j++
+                    continue
+                }
+                if RegExMatch(lb, "^SIZE\s+(\d+)\s*\*\s*(\d+)", &ms) {
+                    columnas := ms[1]
+                    filas    := ms[2]
+                    lineasBloque.Push(j)
+                } else if RegExMatch(lb, "^BASE\s+(\d+)\s*/\s*(\d+)", &mb) {
+                    baseVal := mb[1] . "/" . mb[2]
+                    lineasBloque.Push(j)
+                } else if RegExMatch(lb, "^FRAMED") {
+                    framed := true
+                    lineasBloque.Push(j)
+                } else {
+                    ; Primera línea que no pertenece al bloque — fin del bloque
+                    break
+                }
+                j++
+            }
+
+            ; Construir string de control
+            control := "WL" . filas . "WC" . columnas . "WB" . baseVal
+            if framed
+                control .= "F"
+
+            ventanas[nombreVentana] := {control: control, lineasBloque: lineasBloque}
+            i := j
+            continue
+        }
+        i++
+    }
+
+    ; ── Paso 2: reemplazar SET WINDOW y eliminar bloques DEFINE WINDOW ───────
+    ; Marcar índices a eliminar
+    eliminar := Map()
+    for nombre, datos in ventanas {
+        for idx in datos.lineasBloque
+            eliminar[idx] := true
+    }
+
+    resultado := []
+    i := 1
+    while i <= lineas.Length {
+        if eliminar.Has(i) {
+            i++
+            continue
+        }
+
+        linea := lineas[i]
+
+        if SubStr(linea, 1, 1) != "*" {
+            ; Reemplazar SET WINDOW OFF → SET CONTROL 'WC'
+            if RegExMatch(linea, "i)SET\s+WINDOW\s+OFF") {
+                indentacion := ""
+                k := 1
+                while k <= StrLen(linea) && SubStr(linea, k, 1) = " " {
+                    indentacion .= " "
+                    k++
+                }
+                linea := indentacion . "SET CONTROL 'WB'"
+            } else {
+                ; Reemplazar SET WINDOW '<nombre>' → SET CONTROL '<control>'
+                for nombre, datos in ventanas {
+                    patron := "i)SET\s+WINDOW\s+'" . nombre . "'"
+                    if RegExMatch(linea, patron) {
+                        indentacion := ""
+                        k := 1
+                        while k <= StrLen(linea) && SubStr(linea, k, 1) = " " {
+                            indentacion .= " "
+                            k++
+                        }
+                        linea := indentacion . "SET CONTROL '" . datos.control . "'"
+                        break
+                    }
+                }
+            }
+        }
+
+        resultado.Push(linea)
+        i++
+    }
+
+    contenidoFinal := ""
+    for i, linea in resultado {
+        contenidoFinal .= linea
+        if i < resultado.Length
+            contenidoFinal .= "`n"
+    }
+    return contenidoFinal
+}
+
+; ===== FUNCIÓN: LIMPIAR TIPO Y LONGITUD EN CAMPOS DE VIEW =====
+LimpiarTiposEnView(contenido) {
+    lineas     := StrSplit(contenido, "`n")
+    resultado  := []
+    dentroView := false
+
+    ; Códigos de formato Natural válidos (sin longitud: D y T)
+    tiposSinLong  := "D|T"
+    tiposConLong  := "A|B|F|I|N|P"
+    ; Patrón de tipo con longitud:  (A10)  (N5)  (I2)  (B4)  (F8)  (P3)
+    ; Patrón de tipo sin longitud:  (D)    (T)
+    ; NO tocar: (1:20)  (1:5)  (0:10)  — contienen ':'
+    patronConLong  := "\((" . tiposConLong . ")\d+(\.\d+)?\)"
+    patronSinLong  := "\((" . tiposSinLong . ")\)"
+
+    for linea in lineas {
+        lineaTrim := Trim(linea)
+
+        ; Detectar inicio de bloque VIEW (no comentada)
+        if SubStr(linea, 1, 1) != "*" {
+            if RegExMatch(lineaTrim, "i)^\d+\s+\S+\s+VIEW(\s+OF)?\s+\S+")
+                dentroView := true
+        }
+
+        ; Detectar fin de bloque VIEW: END-DEFINE u otro nivel 1 que no sea VIEW
+        if dentroView && SubStr(linea, 1, 1) != "*" {
+            if InStr(lineaTrim, "END-DEFINE")
+                dentroView := false
+            else if RegExMatch(lineaTrim, "^1\s+") && !RegExMatch(lineaTrim, "i)^1\s+\S+\s+VIEW") {
+                dentroView := false
+            }
+        }
+
+        ; Dentro de un bloque VIEW: eliminar tipo/longitud entre paréntesis
+        ; Solo si el paréntesis NO contiene ':'
+        if dentroView && SubStr(linea, 1, 1) != "*" {
+            ; Eliminar (A10), (N5), (I2), (B4), (F8), (P3), (D), (T), etc.
+            ; Pero respetar (1:20), (0:10), etc.
+            linea := RegExReplace(linea, "\((?![^)]*:)(?:" . tiposConLong . ")\d+(?:\.\d+)?\)", "")
+            linea := RegExReplace(linea, "\((?![^)]*:)(?:" . tiposSinLong . ")\)", "")
+        }
+
+        resultado.Push(linea)
+    }
+
+    contenidoFinal := ""
+    for i, linea in resultado {
+        contenidoFinal .= linea
+        if i < resultado.Length
+            contenidoFinal .= "`n"
+    }
+    return contenidoFinal
+}
+
+; ===== FUNCIÓN: ELIMINAR LÍNEAS 'DEFINE WORK FILE' NO COMENTADAS =====
+EliminarDefineWorkFile(contenido) {
+    lineas := StrSplit(contenido, "`n")
+    resultado := []
+
+    for linea in lineas {
+        ; Si la línea está comentada (columna 1 = '*'), se conserva siempre
+        if SubStr(linea, 1, 1) = "*" {
+            resultado.Push(linea)
+            continue
+        }
+        ; Si contiene 'DEFINE WORK FILE' (no comentada), se elimina
+        if InStr(linea, "DEFINE WORK FILE") {
+            continue
+        }
+        resultado.Push(linea)
+    }
+
+    contenidoFinal := ""
+    for i, linea in resultado {
+        contenidoFinal .= linea
+        if i < resultado.Length
+            contenidoFinal .= "`n"
+    }
+    return contenidoFinal
+}
+
+; ===== FUNCIÓN: TRADUCIR ASIGNACIONES := A COMPUTE = =====
+TraducirAsignaciones(contenido) {
+    lineas := StrSplit(contenido, "`n")
+    resultado := []
+
+    for linea in lineas {
+        ; Solo procesar líneas que no estén comentadas (columna 1 != '*')
+        ; y que contengan el patrón ' := '
+        if SubStr(linea, 1, 1) != "*" && InStr(linea, " := ") {
+            ; Extraer la parte izquierda y derecha del ' := '
+            pos := InStr(linea, " := ")
+            izq := Trim(SubStr(linea, 1, pos - 1))
+            der := Trim(SubStr(linea, pos + 4))
+            ; Reconstruir como: COMPUTE <izq> = <der>
+            ; Preservar la indentación original
+            indentacion := ""
+            i := 1
+            while i <= StrLen(linea) && SubStr(linea, i, 1) = " " {
+                indentacion .= " "
+                i++
+            }
+            linea := indentacion . "COMPUTE " . izq . " = " . der
+        }
+        resultado.Push(linea)
+    }
+
+    contenidoFinal := ""
+    for i, linea in resultado {
+        contenidoFinal .= linea
+        if i < resultado.Length
+            contenidoFinal .= "`n"
+    }
+    return contenidoFinal
+}
+
 ; ===== FUNCIÓN: LIMPIAR ENCABEZADOS DE NATURALONE =====
 LimpiarEncabezadosNatural(contenido) {
     lineasEliminadas := 0
@@ -3002,8 +3259,23 @@ ProcesarVista(lineas, indiceInicio, rutaOrigen) {
         
         ; Buscar información del campo en la DDM
         if !camposDDM.Has(nombreCampo) {
-            ; Campo no encontrado en DDM, agregar comentario
-            lineasGeneradas.Push("**C           0   * CAMPO " . nombreCampo . " NO ENCONTRADO EN DDM")
+            ; Campo no encontrado en DDM — construir **DD con nivel y nombre, sin tipo ni longitud
+            lineaDD := "**DD"
+            lineaDD .= "          "   ; Col 5-14: 10 espacios
+            lineaDD .= "0"            ; Col 15
+            lineaDD .= "   "          ; Col 16-18
+            lineaDD .= " "            ; Col 19: sin tipo
+            lineaDD .= " "            ; Col 20
+            lineaDD .= "   "          ; Col 21-23: sin longitud
+            lineaDD .= " "            ; Col 24: sin tipo estructura
+            lineaDD .= nivelCampo     ; Col 25: nivel
+            lineaDD .= nombreCampo    ; Col 26+: nombre
+            if dimensionesArray != "" {
+                while StrLen(lineaDD) < 57
+                    lineaDD .= " "
+                lineaDD .= dimensionesArray
+            }
+            lineasGeneradas.Push(lineaDD)
             i++
             continue
         }
